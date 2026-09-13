@@ -14,7 +14,7 @@ import time
 from typing import Any, Dict, List, Literal, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -269,8 +269,8 @@ async def serve_index():
 
 
 @app.post("/api/chat", response_model=ChatResponse)
-async def chat_endpoint(request: ChatRequest):
-  """Processes a user query through the tool-augmented ADK 2.0 graph workflow with memory and tracing."""
+async def chat_endpoint(request: ChatRequest, background_tasks: BackgroundTasks):
+  """Processes a user query through the tool-augmented ADK 2.0 graph workflow with async memory & tracing."""
   turn_start = time.perf_counter()
   user_text = request.message.strip()
   if not user_text:
@@ -300,10 +300,11 @@ async def chat_endpoint(request: ChatRequest):
     turn_span.set_attribute("session.id", session_id)
     turn_span.set_attribute("user.id", "web_user")
 
-    # Update session memory with incoming query
+    # Update session memory with incoming query and persist in background
     memory = MemoryStore.get_or_create(session_id)
     extracted_entities = memory.add_user_turn(user_text)
     enriched_query = memory.enrich_query_with_context(user_text)
+    background_tasks.add_task(MemoryStore.save_turn_async, session_id, memory.turns[-1])
 
     logger.info(
         f"Processing chat turn for session {session_id}",
@@ -438,6 +439,7 @@ async def chat_endpoint(request: ChatRequest):
           route=route_taken,
           tools_used=[t.get("name", "tool") for t in tools_used],
       )
+      background_tasks.add_task(MemoryStore.save_turn_async, session_id, memory.turns[-1])
       memory_summary = memory.get_context_summary()
 
       # Record Intent vs Outcome telemetry
@@ -503,6 +505,7 @@ async def chat_endpoint(request: ChatRequest):
           route=route_taken,
           tools_used=[t.get("name", "tool") for t in tools_used],
       )
+      background_tasks.add_task(MemoryStore.save_turn_async, session_id, memory.turns[-1])
       memory_summary = memory.get_context_summary()
 
       intent_outcome = track_intent_vs_outcome(

@@ -48,11 +48,17 @@ flowchart TD
   - `GET /api/session/{id}` & `DELETE /api/session/{id}`: Session inspection and memory management.
   - `POST /api/feedback`: User satisfaction telemetry collection.
 
-### 2. Context & Memory
-- **Multi-Turn Entity Extraction** ([`memory.py`](memory.py)):
-  - Continuously tracks package tracking IDs (`SW-...`), 5-digit postal codes, parcel weights, and order IDs across conversational turns.
-  - Resolves implicit pronoun references (`"when will it arrive?"` automatically refers to previously mentioned tracking numbers).
-  - Enriches the incoming prompt with active session memory so the agent maintains state across turns.
+### 2. Context & Memory ([`memory.py`](memory.py))
+- **Context Bloat Management (Sliding Window & Running Summarization)**:
+  - **Sliding Window**: Restricts prompt injection to the latest $N$ turns (`MEMORY_MAX_RECENT_TURNS=6`), strictly bounding prompt token consumption.
+  - **Progressive Semantic Summarization**: Turns sliding out of the recent window are automatically condensed into a running conversational summary (`running_summary`), retaining crucial context without prompt bloat.
+  - **Pronoun & Implicit Reference Resolution**: Dynamically resolves follow-up queries like *"when will it arrive?"* or *"can I return it?"* using tracked session entities.
+- **Persistent Database Storage (ACID SQLite Backend)**:
+  - Backed by an on-disk SQLite database (`data/sessions.db`) operating in Write-Ahead Logging (WAL) mode.
+  - Preserves session histories, extracted entities, and summaries across application reboots and container recycles.
+- **Asynchronous Background Execution**:
+  - All database write operations, entity extraction, and memory compression run asynchronously in background tasks (`FastAPI.BackgroundTasks` and thread pool executors).
+  - Guarantees zero disk I/O or summarization latency on the critical chat response path.
 
 ### 3. Orchestration & Logic
 - **Granular Intent Classification**: Classifies queries into `shipping` (with sub-intents: `tracking`, `rates`, `delivery_policy`, `returns`, `general_faq`) vs. `unrelated`.
