@@ -7,11 +7,30 @@ topics. It routes shipping queries to a dedicated Shipping FAQ agent and
 unrelated queries to a node that politely declines to answer.
 """
 
+import os
+import sys
+import time
 from typing import Literal
 from google.adk import Agent, Context, Event, Workflow
 from google.adk.apps import App
 from google.adk.workflow import START
 from pydantic import BaseModel, Field
+
+# Ensure observability can be imported
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+if current_dir not in sys.path:
+  sys.path.insert(0, current_dir)
+if parent_dir not in sys.path:
+  sys.path.insert(0, parent_dir)
+
+try:
+  from customer_support_agent.observability import PIIRedactor, get_logger, get_tracer
+except ImportError:
+  from observability import PIIRedactor, get_logger, get_tracer
+
+logger = get_logger("swiftship.agent.workflow")
+tracer = get_tracer("swiftship.agent.workflow")
 
 
 class QueryClassification(BaseModel):
@@ -31,11 +50,31 @@ class QueryClassification(BaseModel):
 
 
 def process_user_query(node_input: str) -> Event:
-  """Extracts the incoming user query and records it in session state."""
-  return Event(
-      output=node_input,
-      state={"user_query": node_input},
-  )
+  """Extracts the incoming user query, sanitizes PII for telemetry, and records it in session state."""
+  with tracer.start_as_current_span("workflow.process_user_query") as span:
+    redacted_query = PIIRedactor.redact(node_input)
+    span.set_attribute("workflow.node", "process_user_query")
+    span.set_attribute("customer.query_redacted", redacted_query)
+
+    logger.info(
+        "Processing user query in workflow node",
+        extra={
+            "event_type": "node_execution",
+            "structured_context": {
+                "node": "process_user_query",
+                "query_length": len(node_input),
+                "query_redacted": redacted_query[:120],
+            },
+        },
+    )
+
+    return Event(
+        output=node_input,
+        state={
+            "user_query": node_input,
+            "workflow_start_time": time.time(),
+        },
+    )
 
 
 classifier_agent = Agent(
@@ -68,7 +107,24 @@ Output your classification matching the required JSON schema with 'category' and
 
 def route_query(node_input: QueryClassification):
   """Evaluates the classification output and yields the appropriate graph route."""
-  yield Event(route=node_input.category)
+  with tracer.start_as_current_span("workflow.route_query") as span:
+    span.set_attribute("workflow.node", "route_query")
+    span.set_attribute("intent.category", node_input.category)
+    span.set_attribute("intent.reasoning", PIIRedactor.redact(node_input.reasoning))
+
+    logger.info(
+        f"Evaluating intent route: '{node_input.category}'",
+        extra={
+            "event_type": "routing_decision",
+            "structured_context": {
+                "node": "route_query",
+                "category": node_input.category,
+                "reasoning": PIIRedactor.redact(node_input.reasoning),
+            },
+        },
+    )
+
+    yield Event(route=node_input.category)
 
 
 shipping_faq_agent = Agent(
@@ -120,17 +176,32 @@ Tone & Guidelines:
 
 def decline_unrelated_query():
   """Politely declines to answer non-shipping queries."""
-  decline_message = (
-      "Thank you for contacting SwiftShip Customer Support! "
-      "I am specialized solely in shipping and logistics services—such as "
-      "calculating shipping rates, tracking packages, providing delivery "
-      "updates, and assisting with returns. "
-      "I am unable to answer queries outside of shipping. "
-      "If you have any questions regarding shipping or package delivery, "
-      "please feel free to ask!"
-  )
-  yield Event(message=decline_message)
-  yield Event(output=decline_message)
+  with tracer.start_as_current_span("workflow.decline_unrelated_query") as span:
+    span.set_attribute("workflow.node", "decline_unrelated_query")
+    span.set_attribute("outcome.action", "declined_unrelated")
+
+    logger.info(
+        "Routing to polite decline handler for unrelated query",
+        extra={
+            "event_type": "decline_unrelated",
+            "structured_context": {
+                "node": "decline_unrelated_query",
+                "action": "polite_decline",
+            },
+        },
+    )
+
+    decline_message = (
+        "Thank you for contacting SwiftShip Customer Support! "
+        "I am specialized solely in shipping and logistics services—such as "
+        "calculating shipping rates, tracking packages, providing delivery "
+        "updates, and assisting with returns. "
+        "I am unable to answer queries outside of shipping. "
+        "If you have any questions regarding shipping or package delivery, "
+        "please feel free to ask!"
+    )
+    yield Event(message=decline_message)
+    yield Event(output=decline_message)
 
 
 # Graph Workflow Definition

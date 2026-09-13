@@ -613,11 +613,11 @@
     if (indicator) indicator.remove();
   }
 
-  function appendAgentMessage(response, route, nodesVisited, reasoning) {
+  function appendAgentMessage(response, route, nodesVisited, reasoning, traceId, latencyMs, intentVsOutcome) {
     const msgDiv = document.createElement('div');
     msgDiv.className = 'message agent';
 
-    // Route Badge
+    // Route Badge & Telemetry Badges
     let routeBadgeHtml = '';
     if (route === 'shipping') {
       routeBadgeHtml = `<span class="route-pill shipping">🟢 Route: Shipping FAQ Agent</span>`;
@@ -625,16 +625,38 @@
       routeBadgeHtml = `<span class="route-pill unrelated">🟠 Route: Polite Decline Node</span>`;
     }
 
-    // Graph Execution Trace
+    let telemetryBadgeHtml = '';
+    if (latencyMs) {
+      telemetryBadgeHtml += `<span class="route-pill" style="background:#f1f5f9;border:1px solid #cbd5e1;color:#475569;">⏱️ ${latencyMs}ms</span>`;
+    }
+    if (traceId) {
+      telemetryBadgeHtml += `<span class="route-pill" style="background:#ede9fe;border:1px solid #ddd6fe;color:#6d28d9;" title="OpenTelemetry Trace ID: ${traceId}">🔍 Trace: ${traceId.slice(0, 8)}…</span>`;
+    }
+
+    // Graph Execution Trace & Intent vs Outcome
     let traceHtml = '';
     if (nodesVisited && nodesVisited.length > 0) {
       const traceString = nodesVisited.join(' ➔ ');
+      let intentHtml = '';
+      if (intentVsOutcome) {
+        const alignColor = intentVsOutcome.outcome?.alignment === 'aligned' ? '#16a34a' : '#ea580c';
+        intentHtml = `
+          <div style="margin-top:6px;padding-top:6px;border-top:1px dashed #e2e8f0;font-size:12px;">
+            <strong>Intent vs. Outcome:</strong> 
+            <span style="color:${alignColor};font-weight:600;">[${intentVsOutcome.outcome?.alignment?.toUpperCase() || 'ALIGNED'}]</span>
+            <span>Intent: <em>${intentVsOutcome.intent?.category}</em> ➔ Outcome: <em>${intentVsOutcome.outcome?.action}</em> (${intentVsOutcome.outcome?.target_node})</span>
+          </div>
+        `;
+      }
+
       traceHtml = `
         <details class="trace-details">
-          <summary>⚡ Graph Execution Trace (${nodesVisited.length} nodes)</summary>
+          <summary>⚡ Observability & Graph Trace (${nodesVisited.length} nodes)</summary>
           <div class="trace-content">
             <strong>DAG Path:</strong> ${traceString}<br>
-            ${reasoning ? `<strong>Classifier Reasoning:</strong> ${reasoning}` : ''}
+            ${reasoning ? `<strong>Classifier Reasoning:</strong> ${reasoning}<br>` : ''}
+            ${traceId ? `<strong>OTel Trace ID:</strong> <code>${traceId}</code><br>` : ''}
+            ${intentHtml}
           </div>
         </details>
       `;
@@ -646,6 +668,7 @@
         <div class="message-bubble">${renderMarkdown(response)}</div>
         <div class="meta-box">
           ${routeBadgeHtml}
+          ${telemetryBadgeHtml}
           ${traceHtml}
         </div>
       </div>
@@ -679,7 +702,15 @@
 
       const data = await res.json();
       sessionId = data.session_id;
-      appendAgentMessage(data.response, data.route, data.nodes_visited, data.reasoning);
+      appendAgentMessage(
+        data.response,
+        data.route,
+        data.nodes_visited,
+        data.reasoning,
+        data.trace_id,
+        data.latency_ms,
+        data.intent_vs_outcome
+      );
     } catch (e) {
       removeTypingIndicator();
       appendAgentMessage(`⚠️ Connection error: ${e.message}. Is the server running?`, 'unrelated', []);

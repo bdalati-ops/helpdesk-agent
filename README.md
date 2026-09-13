@@ -49,17 +49,63 @@ flowchart TD
 
 ```text
 customer-support-agent/
-├── .env.example          # Environment variable template for Gemini / Vertex AI
-├── .gitignore            # Git exclusions for secrets, caches, and virtualenvs
-├── __init__.py           # Package entry point exporting agent
-├── agent.py              # ADK 2.0 Workflow definitions, schemas, and nodes
-├── pyproject.toml        # Project metadata and dependencies
-├── requirements.txt      # Python dependencies
-├── README.md             # Project documentation
+├── .dockerignore          # Docker build exclusions (.env, caches, venv)
+├── .env.example           # Environment variable template for Gemini / Vertex AI
+├── .gitignore             # Git exclusions for secrets, caches, and virtualenvs
+├── Dockerfile             # Production container definition for Cloud Run
+├── README.md              # Project documentation
+├── __init__.py            # Package entry point exporting agent
+├── agent.py               # ADK 2.0 Workflow definitions, schemas, and instrumented nodes
+├── deploy.sh              # Sanitized Cloud Run deployment script
+├── observability.py       # OpenTelemetry tracing, structured JSON logging, PII redaction & intent tracking
+├── pyproject.toml         # Project metadata and dependencies
+├── requirements.txt       # Python dependencies (google-adk, opentelemetry, etc.)
+├── run.py                 # Interactive REPL and CLI runner with telemetry
+├── run_mock.py            # Hermetic test runner for DAG verification
+├── server.py              # FastAPI server with chat API, tracing middleware, and UI hosting
+├── static/
+│   └── index.html         # SwiftShip responsive Web UI with DAG trace inspector
 └── tests/
     ├── __init__.py
-    └── test_workflow.py  # Unit tests for schemas, nodes, and graph structure
+    ├── test_observability.py # Unit tests for tracing, logging, PII redaction, intent tracking
+    └── test_workflow.py   # Unit tests for schemas, nodes, and graph structure
 ```
+
+---
+
+## Observability & Tracing
+
+The agent engine includes an observability framework built on **OpenTelemetry** and structured JSON logging:
+
+### 1. OpenTelemetry Distributed Tracing
+- **Span Hierarchy**: Every customer interaction creates a root span (`http.request` or `cli.query_turn`) containing child spans for workflow execution (`workflow.runner_execution`), user query processing (`workflow.process_user_query`), intent routing (`workflow.route_query`), and decline/FAQ execution.
+- **Trace Context Propagation**: Automatically sets `X-Trace-Id` on HTTP responses for end-to-end correlation with frontend clients and upstream services.
+- **Span Status & Exceptions**: Errors are captured via `span.record_exception()` and marked with `StatusCode.ERROR`.
+
+### 2. Structured JSON Logging with Cloud Logging Correlation
+- Every log message is formatted as a single-line JSON object compliant with Google Cloud Logging / W3C standards.
+- Automatic correlation with active trace and span IDs:
+  - `trace_id` and `span_id`
+  - `logging.googleapis.com/trace` (`projects/{PROJECT_ID}/traces/{TRACE_ID}`)
+  - `logging.googleapis.com/spanId`
+  - `logging.googleapis.com/trace_sampled`
+- Contextual attributes and structured error stack traces.
+
+### 3. Intent vs. Outcome Tracking
+- Tracks and audits every interaction by comparing:
+  - **Detected Intent**: User query intent category (`shipping` vs `unrelated`) and LLM reasoning.
+  - **Actual Outcome**: Target node executed (`shipping_faq_agent` vs `decline_unrelated_query`), action taken (`answered_faq` vs `declined_unrelated`), and execution alignment (`aligned` vs `mismatched`).
+  - **Performance Metrics**: End-to-end execution latency in milliseconds.
+- Emits a dedicated audit log event (`event_type: "intent_vs_outcome"`) and sets span attributes on the active trace.
+
+### 4. PII Redaction Engine
+- Real-time sanitization of customer data across logs, telemetry spans, and session state:
+  - **Email Addresses**: `\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b` ➔ `[REDACTED_EMAIL]`
+  - **Phone Numbers**: 7-digit, 10-digit, and international formats ➔ `[REDACTED_PHONE]`
+  - **Credit / Debit Cards**: 13–16 digit payment card numbers ➔ `[REDACTED_CARD]`
+  - **Social Security Numbers**: `###-##-####` ➔ `[REDACTED_SSN]`
+  - **API Tokens & Secrets**: `ghp_...`, `AIza...`, `ya29...`, `AQ...` ➔ `[REDACTED_SECRET]`
+- **Preserved Tracking Numbers**: SwiftShip tracking numbers (`SW-123456789`) are preserved to allow legitimate shipping status lookups.
 
 ---
 
