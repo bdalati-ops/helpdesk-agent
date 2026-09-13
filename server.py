@@ -45,6 +45,7 @@ try:
   )
   from customer_support_agent.tools import get_available_tools_metadata
   from customer_support_agent.memory import MemoryStore, SessionMemory
+  from customer_support_agent.hitl import HITLManager
   from customer_support_agent.resilience import (
       classify_query_heuristically,
       generate_fallback_shipping_response,
@@ -61,6 +62,7 @@ except ImportError:
   )
   from tools import get_available_tools_metadata
   from memory import MemoryStore, SessionMemory
+  from hitl import HITLManager
   from resilience import (
       classify_query_heuristically,
       generate_fallback_shipping_response,
@@ -188,6 +190,8 @@ class ChatResponse(BaseModel):
   latency_ms: Optional[float] = Field(default=None, description="Execution turn latency in milliseconds.")
   tools_used: List[Dict[str, Any]] = Field(default_factory=list, description="List of tools invoked during this turn.")
   memory_context: Optional[Dict[str, Any]] = Field(default=None, description="Active multi-turn entity and session state.")
+  requires_human_confirmation: bool = Field(default=False, description="Whether this interaction triggered a Human-in-the-Loop hook.")
+  hitl_ticket: Optional[Dict[str, Any]] = Field(default=None, description="Human-in-the-Loop confirmation ticket details.")
   intent_vs_outcome: Optional[Dict[str, Any]] = Field(default=None, description="Intent vs Outcome audit payload.")
 
 
@@ -195,6 +199,13 @@ class FeedbackRequest(BaseModel):
   session_id: str = Field(description="Session ID associated with the interaction.")
   rating: Literal["helpful", "unhelpful"] = Field(description="Customer rating.")
   comment: Optional[str] = Field(default=None, description="Optional user comment or feedback.")
+
+
+class HITLConfirmRequest(BaseModel):
+  ticket_id: str = Field(description="The HITL confirmation ticket ID (e.g. HITL-2026...).")
+  action: Literal["approve", "reject"] = Field(description="Supervisor approval decision.")
+  reviewer: str = Field(default="supervisor", description="Name or identifier of the reviewing supervisor.")
+  notes: Optional[str] = Field(default=None, description="Optional justification or instructions.")
 
 
 # ==============================================================================
@@ -259,6 +270,34 @@ async def record_feedback(feedback: FeedbackRequest):
   return {"status": "success", "message": "Feedback recorded. Thank you!"}
 
 
+@app.get("/api/hitl/pending")
+async def get_pending_hitl_tickets():
+  """Returns all pending Human-in-the-Loop confirmation tickets awaiting supervisor review."""
+  return {
+      "pending_tickets": HITLManager.list_pending_tickets(),
+      "count": len(HITLManager.list_pending_tickets()),
+  }
+
+
+@app.post("/api/hitl/confirm")
+async def confirm_hitl_action(request: HITLConfirmRequest):
+  """Allows a supervisor to approve or reject a pending high-impact action."""
+  if request.action == "approve":
+    ticket = HITLManager.approve_ticket(request.ticket_id, approver=request.reviewer, notes=request.notes)
+  else:
+    ticket = HITLManager.reject_ticket(request.ticket_id, reviewer=request.reviewer, reason=request.notes or "Rejected by supervisor")
+
+  if not ticket:
+    raise HTTPException(status_code=404, detail=f"Ticket '{request.ticket_id}' not found.")
+
+  return {
+      "status": "success",
+      "ticket_id": ticket.ticket_id,
+      "ticket_status": ticket.status,
+      "resolution_notes": ticket.resolution_notes,
+  }
+
+
 @app.get("/", response_class=HTMLResponse)
 async def serve_index():
   """Serves the interactive web chat interface."""
@@ -294,8 +333,9 @@ async def chat_endpoint(request: ChatRequest, background_tasks: BackgroundTasks)
       session_id = session.id
       sessions[session_id] = session_id
 
-    # Make session_id accessible to workflow nodes
+    # Make session_id and user query accessible to workflow nodes
     os.environ["CURRENT_SESSION_ID"] = session_id
+    os.environ["CURRENT_USER_QUERY"] = user_text
 
     turn_span.set_attribute("session.id", session_id)
     turn_span.set_attribute("user.id", "web_user")
@@ -305,6 +345,12 @@ async def chat_endpoint(request: ChatRequest, background_tasks: BackgroundTasks)
     extracted_entities = memory.add_user_turn(user_text)
     enriched_query = memory.enrich_query_with_context(user_text)
     background_tasks.add_task(MemoryStore.save_turn_async, session_id, memory.turns[-1])
+
+    # Evaluate Human-in-the-Loop confirmation requirement
+    hitl_ticket_obj = HITLManager.evaluate_hitl_requirement(session_id, user_text, "shipping", extracted_entities)
+    requires_hitl = hitl_ticket_obj is not None
+    hitl_ticket_data = hitl_ticket_obj.__dict__ if hitl_ticket_obj else None
+    turn_span.set_attribute("hitl.required", requires_hitl)
 
     logger.info(
         f"Processing chat turn for session {session_id}",
@@ -466,6 +512,8 @@ async def chat_endpoint(request: ChatRequest, background_tasks: BackgroundTasks)
           latency_ms=round(duration_ms, 2),
           tools_used=tools_used,
           memory_context=memory_summary,
+          requires_human_confirmation=requires_hitl,
+          hitl_ticket=hitl_ticket_data,
           intent_vs_outcome=intent_outcome,
       )
 
@@ -531,6 +579,8 @@ async def chat_endpoint(request: ChatRequest, background_tasks: BackgroundTasks)
           latency_ms=round(duration_ms, 2),
           tools_used=tools_used,
           memory_context=memory_summary,
+          requires_human_confirmation=requires_hitl,
+          hitl_ticket=hitl_ticket_data,
           intent_vs_outcome=intent_outcome,
       )
 

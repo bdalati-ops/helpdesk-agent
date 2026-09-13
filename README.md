@@ -22,13 +22,17 @@ Deployment files are omitted as requested.
 ```mermaid
 flowchart TD
     START([START]) --> ProcessInput["process_user_query\n• Multi-Turn Memory Resolution\n• Entity Extraction (SW-..., zips, weights)\n• PII Sanitization & Telemetry"]
-    ProcessInput --> Classifier["query_classifier (Agent)\n• Intent & Sub-Intent Categorization\n• Confidence Scoring & Reasoning"]
-    Classifier --> Router{"route_query\n(Conditional Branch)"}
-    Router -->|route: shipping| ShippingFAQ["shipping_faq_agent (Agent)\n• Equipped with 4 Callable Domain Tools\n• Multi-Turn Context-Aware Synthesis"]
+    ProcessInput --> Classifier["query_classifier (Agent - Tier 1: Flash)\n• Intent & Sub-Intent Categorization\n• Confidence Scoring & Reasoning"]
+    Classifier --> Router{"route_query\n(Strategic Branching)"}
+    Router -->|route: shipping| ShippingFAQ["shipping_faq_agent (Agent - Tier 2: Flash)\n• Equipped with 4 Callable Domain Tools\n• Multi-Turn Context-Aware Synthesis"]
+    Router -->|route: complex_claim| ClaimsAgent["complex_claim_agent (Agent - Tier 3: Pro)\n• Deep Reasoning for Freight Disputes\n• Formal Claims & SLA Arbitration"]
+    Router -->|route: hitl_confirmation| HITLNode["hitl_confirmation_node (Node)\n• In-transit rerouting, >$100 refunds, supervisor\n• Generates Confirmation Ticket & Halts"]
     Router -->|route: unrelated| DeclineNode["decline_unrelated_query (Node)\n(Politely declines to answer)"]
     ShippingFAQ -.-> Tools["Domain Tools (tools.py)\n• track_package\n• calculate_shipping_rate\n• query_delivery_policies\n• create_return_request"]
     Tools -.-> ShippingFAQ
     ShippingFAQ --> END([END])
+    ClaimsAgent --> END([END])
+    HITLNode --> END([END])
     DeclineNode --> END([END])
 ```
 
@@ -47,6 +51,7 @@ flowchart TD
   - `GET /api/tools`: Introspectable tool catalog with parameter schemas.
   - `GET /api/session/{id}` & `DELETE /api/session/{id}`: Session inspection and memory management.
   - `POST /api/feedback`: User satisfaction telemetry collection.
+  - `GET /api/hitl/pending` & `POST /api/hitl/confirm`: Supervisor governance endpoints for inspecting and approving pending actions.
 
 ### 2. Context & Memory ([`memory.py`](memory.py))
 - **Context Bloat Management (Sliding Window & Running Summarization)**:
@@ -61,7 +66,20 @@ flowchart TD
   - Guarantees zero disk I/O or summarization latency on the critical chat response path.
 
 ### 3. Orchestration & Logic
-- **Granular Intent Classification**: Classifies queries into `shipping` (with sub-intents: `tracking`, `rates`, `delivery_policy`, `returns`, `general_faq`) vs. `unrelated`.
+- **Strategic Tiered Model Routing** ([`agent.py`](agent.py)):
+  - Matches cognitive complexity to the ideal model family rather than using a single default model for all tasks, optimizing token economics, inference speed, and depth of reasoning:
+    - **Tier 1 (Fast Triage & Classification)**: `gemini-2.0-flash` for `query_classifier`. Ultra-low latency classification and entity parsing.
+    - **Tier 2 (Domain Synthesis & Tool Execution)**: `gemini-2.5-flash` for `shipping_faq_agent`. High-fidelity multi-tool synthesis, tracking, and rate quotes.
+    - **Tier 3 (Complex Reasoning & Disputes)**: `gemini-2.5-pro` for `complex_claim_agent`. Deep multi-step reasoning for freight disputes, lost/damaged cargo, and formal liability claims.
+- **Human-in-the-Loop (HITL) Confirmation Hooks** ([`hitl.py`](hitl.py)):
+  - Enforces mandatory human supervisor authorization before executing high-impact, sensitive operations:
+    1. **In-Transit Package Rerouting & Address Changes**: Halts autonomous flow to prevent package theft and delivery diversion fraud.
+    2. **High-Value Refund & Claim Thresholds**: Automatically intercepts refund or compensation requests exceeding `$100.00` (`HITL_REFUND_THRESHOLD`).
+    3. **Explicit Supervisor Escalation**: Routes customer requests for human intervention directly to the supervisor review queue.
+  - **Confirmation Ticket Lifecycle**: Generates signed confirmation tickets (`HITLConfirmationRequest`) in session memory, halting autonomous execution with a clear notification and ticket reference.
+  - **Supervisor Governance REST APIs**:
+    - `GET /api/hitl/pending`: Returns pending requests awaiting human operator sign-off.
+    - `POST /api/hitl/confirm`: Allows supervisors to approve or reject tickets with review notes.
 - **Fault-Tolerant Resilience Engine** ([`resilience.py`](resilience.py)):
   - Handles `503 UNAVAILABLE`, quota limits, and temporary model spikes with exponential backoff and jitter.
   - Automatic graceful degradation executes domain tools directly during model outages to ensure continuous service with zero HTTP 500/503 errors.
@@ -73,9 +91,11 @@ flowchart TD
 | Component | Type | Responsibility |
 |---|---|---|
 | `process_user_query` | Function Node | Ingests query, extracts entities into `SessionMemory`, enriches prompt with cross-turn context, and sanitizes PII. |
-| `query_classifier` | `LlmAgent` | Classifies intent into categories and sub-intents with confidence scoring. |
-| `route_query` | Function Node | Evaluates classification output and directs workflow traversal. |
-| `shipping_faq_agent` | `LlmAgent` + Tools | Tool-augmented agent executing tracking, rate calculations, policies, and RMA generation. |
+| `query_classifier` | `LlmAgent` (Tier 1) | Fast intent classification specialist triaging queries using `gemini-2.0-flash`. |
+| `route_query` | Function Node | Evaluates classification output and HITL state to direct workflow traversal. |
+| `shipping_faq_agent` | `LlmAgent` + Tools (Tier 2) | Tool-augmented domain agent using `gemini-2.5-flash` for rates, tracking, policies, and RMA generation. |
+| `complex_claim_agent` | `LlmAgent` (Tier 3) | Deep reasoning claims specialist using `gemini-2.5-pro` for freight damage disputes. |
+| `hitl_confirmation_node` | Function Node | Halts automatic execution for high-impact actions, emitting a pending supervisor review notice with ticket ID. |
 | `decline_unrelated_query` | Function Node | Deterministic polite decline node handling non-shipping queries. |
 | `root_agent` | `Workflow` | Top-level graph managing state transitions, memory propagation, and routing. |
 
@@ -93,17 +113,23 @@ customer-support-agent/
 ├── __init__.py            # Package entry point exporting agent
 ├── agent.py               # ADK 2.0 Workflow definitions, schemas, and instrumented nodes
 ├── deploy.sh              # Sanitized Cloud Run deployment script
+├── hitl.py                # Human-in-the-Loop manager, ticket lifecycle & governance hooks
+├── memory.py              # Context & memory manager (sliding window, summarization, SQLite)
 ├── observability.py       # OpenTelemetry tracing, structured JSON logging, PII redaction & intent tracking
 ├── pyproject.toml         # Project metadata and dependencies
 ├── requirements.txt       # Python dependencies (google-adk, opentelemetry, etc.)
+├── resilience.py          # Exponential backoff, jitter, and fallback degradation
 ├── run.py                 # Interactive REPL and CLI runner with telemetry
 ├── run_mock.py            # Hermetic test runner for DAG verification
 ├── server.py              # FastAPI server with chat API, tracing middleware, and UI hosting
 ├── static/
 │   └── index.html         # SwiftShip responsive Web UI with DAG trace inspector
+├── tools.py               # Callable domain tools (rates, tracking, RMA, policies)
 └── tests/
     ├── __init__.py
     ├── test_observability.py # Unit tests for tracing, logging, PII redaction, intent tracking
+    ├── test_resilience.py    # Unit tests for resilience and fallback
+    ├── test_strategic_routing_and_hitl.py # Unit tests for model tiers and HITL governance
     └── test_workflow.py   # Unit tests for schemas, nodes, and graph structure
 ```
 
