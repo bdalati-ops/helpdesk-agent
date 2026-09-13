@@ -1,18 +1,24 @@
-"""FastAPI web server serving the Customer Support Agent and interactive Web UI."""
+"""FastAPI web server serving the Customer Support Agent, REST APIs, and Web UI.
+
+Features:
+  - Tool & Interface Design: Exposes tools catalog, session inspection, and user feedback endpoints.
+  - Context & Memory: Multi-turn session persistence, entity tracking, and cross-turn reference resolution.
+  - Orchestration & Logic: Resilient retry, OpenTelemetry distributed tracing, and zero-downtime graceful fallback.
+"""
 
 import asyncio
 import json
 import os
 import sys
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from google.adk.runners import InMemoryRunner
 from google.genai import types
 from opentelemetry import trace
@@ -37,6 +43,14 @@ try:
       setup_observability,
       track_intent_vs_outcome,
   )
+  from customer_support_agent.tools import get_available_tools_metadata
+  from customer_support_agent.memory import MemoryStore, SessionMemory
+  from customer_support_agent.resilience import (
+      classify_query_heuristically,
+      generate_fallback_shipping_response,
+      generate_fallback_decline_response,
+      is_retryable_error,
+  )
 except ImportError:
   from observability import (
       PIIRedactor,
@@ -44,6 +58,14 @@ except ImportError:
       get_tracer,
       setup_observability,
       track_intent_vs_outcome,
+  )
+  from tools import get_available_tools_metadata
+  from memory import MemoryStore, SessionMemory
+  from resilience import (
+      classify_query_heuristically,
+      generate_fallback_shipping_response,
+      generate_fallback_decline_response,
+      is_retryable_error,
   )
 
 tracer = setup_observability(service_name="swiftship-customer-support")
@@ -58,29 +80,13 @@ initialize_app_secrets()
 
 from customer_support_agent.agent import root_agent
 
-# Resilience & Fault Tolerance (503 UNAVAILABLE & demand spike handling)
-try:
-  from customer_support_agent.resilience import (
-      classify_query_heuristically,
-      generate_fallback_shipping_response,
-      generate_fallback_decline_response,
-      is_retryable_error,
-  )
-except ImportError:
-  from resilience import (
-      classify_query_heuristically,
-      generate_fallback_shipping_response,
-      generate_fallback_decline_response,
-      is_retryable_error,
-  )
-
 app = FastAPI(
-    title="SwiftShip Customer Support Agent",
-    description="ADK 2.0 Graph Workflow Agent for Shipping Customer Support with Observability & Tracing",
-    version="2.0.0",
+    title="SwiftShip Customer Support Agent API",
+    description="ADK 2.0 Graph Workflow Agent with Tool Design, Multi-Turn Memory, and Tracing",
+    version="2.1.0",
 )
 
-# Enable CORS
+# Enable CORS for web UI clients
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -91,54 +97,51 @@ app.add_middleware(
 
 
 @app.middleware("http")
-async def observability_middleware(request: Request, call_next):
-  """Intercepts HTTP requests to inject distributed tracing and structured access logs."""
+async def opentelemetry_logging_middleware(request: Request, call_next):
+  """HTTP middleware that instruments incoming requests with OpenTelemetry spans and correlation headers."""
   start_time = time.perf_counter()
   method = request.method
   path = request.url.path
 
-  with tracer.start_as_current_span(
-      f"http.{method.lower()}",
-      attributes={
-          "http.method": method,
-          "http.url": str(request.url),
-          "http.target": path,
-          "http.client_ip": request.client.host if request.client else "unknown",
-      },
-  ) as span:
+  with tracer.start_as_current_span(f"http.{method.lower()}") as span:
     span_ctx = span.get_span_context()
     trace_id_hex = (
-        format(span_ctx.trace_id, "032x") if span_ctx.is_valid else ""
+        format(span_ctx.trace_id, "032x") if span_ctx.is_valid else "n/a"
     )
+
+    span.set_attribute("http.method", method)
+    span.set_attribute("http.route", path)
+    span.set_attribute("http.url", str(request.url))
 
     try:
       response: Response = await call_next(request)
       duration_ms = (time.perf_counter() - start_time) * 1000
 
-      if trace_id_hex:
-        response.headers["X-Trace-Id"] = trace_id_hex
       span.set_attribute("http.status_code", response.status_code)
+      span.set_attribute("http.duration_ms", duration_ms)
+
+      if trace_id_hex != "n/a":
+        response.headers["X-Trace-Id"] = trace_id_hex
 
       if not path.startswith("/static"):
         logger.info(
-            f"{method} {path} -> {response.status_code} ({round(duration_ms, 1)}ms)",
+            f"{method} {path} - {response.status_code} ({duration_ms:.1f}ms)",
             extra={
-                "event_type": "http_access",
+                "event_type": "http_request",
                 "structured_context": {
                     "method": method,
                     "path": path,
                     "status_code": response.status_code,
                     "duration_ms": round(duration_ms, 2),
-                    "client_ip": (
-                        request.client.host if request.client else "unknown"
-                    ),
                 },
             },
         )
       return response
+
     except Exception as exc:
       duration_ms = (time.perf_counter() - start_time) * 1000
       span.set_attribute("http.status_code", 500)
+      span.record_exception(exc)
       logger.error(
           f"Unhandled exception on {method} {path}: {exc}",
           exc_info=True,
@@ -160,37 +163,105 @@ static_dir = os.path.join(current_dir, "static")
 os.makedirs(static_dir, exist_ok=True)
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
-# Initialize ADK Runner and Session Store
+# Initialize ADK Runner
 APP_NAME = "swiftship_customer_support"
 runner = InMemoryRunner(agent=root_agent, app_name=APP_NAME)
 sessions: dict[str, str] = {}
 
 
+# ==============================================================================
+# API Request & Response Schemas (Interface Design)
+# ==============================================================================
+
 class ChatRequest(BaseModel):
-  message: str
-  session_id: Optional[str] = None
+  message: str = Field(description="The user's query or message to customer support.")
+  session_id: Optional[str] = Field(default=None, description="Unique session identifier for multi-turn memory.")
 
 
 class ChatResponse(BaseModel):
-  response: str
-  session_id: str
-  nodes_visited: list[str]
-  route: Optional[str] = None
-  reasoning: Optional[str] = None
-  trace_id: Optional[str] = None
-  latency_ms: Optional[float] = None
-  intent_vs_outcome: Optional[Dict[str, Any]] = None
+  response: str = Field(description="The agent's text response to the user.")
+  session_id: str = Field(description="Session identifier.")
+  nodes_visited: list[str] = Field(description="DAG nodes traversed during execution.")
+  route: Optional[str] = Field(default=None, description="Routing path chosen ('shipping' or 'unrelated').")
+  reasoning: Optional[str] = Field(default=None, description="Intent classification rationale.")
+  trace_id: Optional[str] = Field(default=None, description="OpenTelemetry distributed trace identifier.")
+  latency_ms: Optional[float] = Field(default=None, description="Execution turn latency in milliseconds.")
+  tools_used: List[Dict[str, Any]] = Field(default_factory=list, description="List of tools invoked during this turn.")
+  memory_context: Optional[Dict[str, Any]] = Field(default=None, description="Active multi-turn entity and session state.")
+  intent_vs_outcome: Optional[Dict[str, Any]] = Field(default=None, description="Intent vs Outcome audit payload.")
 
+
+class FeedbackRequest(BaseModel):
+  session_id: str = Field(description="Session ID associated with the interaction.")
+  rating: Literal["helpful", "unhelpful"] = Field(description="Customer rating.")
+  comment: Optional[str] = Field(default=None, description="Optional user comment or feedback.")
+
+
+# ==============================================================================
+# REST Endpoints
+# ==============================================================================
 
 @app.get("/health")
 async def health_check():
-  """Health check endpoint for Cloud Run."""
-  return {"status": "ok", "app": APP_NAME, "version": "1.0.0"}
+  """Health check endpoint for Cloud Run and monitoring probes."""
+  return {
+      "status": "ok",
+      "app": APP_NAME,
+      "version": "2.1.0",
+      "active_sessions": MemoryStore.active_session_count(),
+  }
+
+
+@app.get("/api/tools")
+async def list_tools():
+  """Returns the catalog of callable tools registered with the Customer Support Agent."""
+  return {
+      "tools": get_available_tools_metadata(),
+      "count": len(get_available_tools_metadata()),
+  }
+
+
+@app.get("/api/session/{session_id}")
+async def get_session_history(session_id: str):
+  """Returns multi-turn conversation history and accumulated memory context for a session."""
+  memory = MemoryStore.get(session_id)
+  if not memory:
+    raise HTTPException(status_code=404, detail="Session not found or has expired.")
+  return {
+      "session_id": session_id,
+      "summary": memory.get_context_summary(),
+      "turns": memory.get_history_messages(),
+  }
+
+
+@app.delete("/api/session/{session_id}")
+async def reset_session(session_id: str):
+  """Clears conversation history and memory context for a session."""
+  MemoryStore.clear(session_id)
+  sessions.pop(session_id, None)
+  return {"status": "cleared", "session_id": session_id}
+
+
+@app.post("/api/feedback")
+async def record_feedback(feedback: FeedbackRequest):
+  """Records customer satisfaction feedback."""
+  logger.info(
+      f"Received feedback for session {feedback.session_id}: {feedback.rating}",
+      extra={
+          "event_type": "user_feedback",
+          "structured_context": {
+              "session_id": feedback.session_id,
+              "rating": feedback.rating,
+              "comment": feedback.comment,
+          },
+      },
+  )
+  return {"status": "success", "message": "Feedback recorded. Thank you!"}
 
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_index():
-  """Serves the main customer support chat interface."""
+  """Serves the interactive web chat interface."""
   index_path = os.path.join(static_dir, "index.html")
   if os.path.exists(index_path):
     return FileResponse(index_path)
@@ -199,7 +270,7 @@ async def serve_index():
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest):
-  """Processes a user message through the ADK 2.0 graph workflow with OpenTelemetry and intent tracking."""
+  """Processes a user query through the tool-augmented ADK 2.0 graph workflow with memory and tracing."""
   turn_start = time.perf_counter()
   user_text = request.message.strip()
   if not user_text:
@@ -207,9 +278,7 @@ async def chat_endpoint(request: ChatRequest):
 
   with tracer.start_as_current_span("customer_support.chat_turn") as turn_span:
     span_ctx = turn_span.get_span_context()
-    trace_id_hex = (
-        format(span_ctx.trace_id, "032x") if span_ctx.is_valid else None
-    )
+    trace_id_hex = format(span_ctx.trace_id, "032x") if span_ctx.is_valid else None
 
     # Redact customer query for privacy-safe logs and trace attributes
     clean_query = PIIRedactor.redact(user_text)
@@ -225,8 +294,16 @@ async def chat_endpoint(request: ChatRequest):
       session_id = session.id
       sessions[session_id] = session_id
 
+    # Make session_id accessible to workflow nodes
+    os.environ["CURRENT_SESSION_ID"] = session_id
+
     turn_span.set_attribute("session.id", session_id)
     turn_span.set_attribute("user.id", "web_user")
+
+    # Update session memory with incoming query
+    memory = MemoryStore.get_or_create(session_id)
+    extracted_entities = memory.add_user_turn(user_text)
+    enriched_query = memory.enrich_query_with_context(user_text)
 
     logger.info(
         f"Processing chat turn for session {session_id}",
@@ -237,17 +314,19 @@ async def chat_endpoint(request: ChatRequest):
                 "user_id": "web_user",
                 "query_redacted": clean_query[:120],
                 "query_length": len(user_text),
+                "entities": extracted_entities,
             },
         },
     )
 
     message_content = types.Content(
         role="user",
-        parts=[types.Part.from_text(text=user_text)],
+        parts=[types.Part.from_text(text=enriched_query)],
     )
 
     nodes_visited = []
     response_texts = []
+    tools_used = []
     route_taken = None
     reasoning_text = None
 
@@ -255,10 +334,12 @@ async def chat_endpoint(request: ChatRequest):
       with tracer.start_as_current_span("workflow.runner_execution") as wf_span:
         max_attempts = 3
         last_err = None
+
         for attempt in range(1, max_attempts + 1):
           try:
             nodes_visited.clear()
             response_texts.clear()
+            tools_used.clear()
             route_taken = None
             reasoning_text = None
 
@@ -277,11 +358,20 @@ async def chat_endpoint(request: ChatRequest):
               if hasattr(event, "actions") and event.actions and event.actions.route:
                 route_taken = event.actions.route
 
+              # Detect tool executions from events if present
+              if hasattr(event, "tools") and event.tools:
+                for t in event.tools:
+                  tools_used.append({"name": getattr(t, "name", "tool")})
+
               # Collect agent messages
               if event.content and event.content.parts:
                 for part in event.content.parts:
-                  if part.text:
-                    # Check if this part contains classifier JSON metadata
+                  if hasattr(part, "function_call") and part.function_call:
+                    tools_used.append({
+                        "name": part.function_call.name,
+                        "args": dict(part.function_call.args or {}),
+                    })
+                  elif part.text:
                     if '"category":' in part.text and '"reasoning":' in part.text:
                       try:
                         parsed = json.loads(part.text)
@@ -294,6 +384,7 @@ async def chat_endpoint(request: ChatRequest):
 
             last_err = None
             break
+
           except Exception as run_err:
             last_err = run_err
             if is_retryable_error(run_err) and attempt < max_attempts:
@@ -330,8 +421,6 @@ async def chat_endpoint(request: ChatRequest):
         )
 
       duration_ms = (time.perf_counter() - turn_start) * 1000
-
-      # Determine target node and outcome action
       target_node = (
           "shipping_faq_agent"
           if "shipping_faq_agent" in nodes_visited
@@ -342,6 +431,14 @@ async def chat_endpoint(request: ChatRequest):
           if target_node == "shipping_faq_agent"
           else "declined_unrelated"
       )
+
+      # Register agent response in multi-turn memory
+      memory.add_agent_turn(
+          response=final_response,
+          route=route_taken,
+          tools_used=[t.get("name", "tool") for t in tools_used],
+      )
+      memory_summary = memory.get_context_summary()
 
       # Record Intent vs Outcome telemetry
       intent_outcome = track_intent_vs_outcome(
@@ -365,13 +462,15 @@ async def chat_endpoint(request: ChatRequest):
           reasoning=reasoning_text,
           trace_id=trace_id_hex,
           latency_ms=round(duration_ms, 2),
+          tools_used=tools_used,
+          memory_context=memory_summary,
           intent_vs_outcome=intent_outcome,
       )
 
     except Exception as e:
       duration_ms = (time.perf_counter() - turn_start) * 1000
       logger.warning(
-          f"Workflow execution encountered model outage/transient error ({e}). Engaging graceful degradation.",
+          f"Workflow execution encountered model outage/transient error ({e}). Engaging graceful tool degradation.",
           extra={
               "event_type": "workflow_graceful_fallback",
               "structured_context": {
@@ -383,7 +482,7 @@ async def chat_endpoint(request: ChatRequest):
           },
       )
 
-      # Intelligent heuristic fallback response
+      # Intelligent heuristic fallback response with tool execution
       fallback_intent = classify_query_heuristically(user_text)
       route_taken = fallback_intent["category"]
       reasoning_text = fallback_intent["reasoning"]
@@ -391,13 +490,20 @@ async def chat_endpoint(request: ChatRequest):
       if route_taken == "shipping":
         target_node = "shipping_faq_agent"
         outcome_action = "answered_faq_fallback"
-        final_response = generate_fallback_shipping_response(user_text)
+        final_response, tools_used = generate_fallback_shipping_response(user_text)
         nodes_visited = ["process_user_query", "query_classifier", "route_query", "shipping_faq_agent"]
       else:
         target_node = "decline_unrelated_query"
         outcome_action = "declined_unrelated_fallback"
         final_response = generate_fallback_decline_response()
         nodes_visited = ["process_user_query", "query_classifier", "route_query", "decline_unrelated_query"]
+
+      memory.add_agent_turn(
+          response=final_response,
+          route=route_taken,
+          tools_used=[t.get("name", "tool") for t in tools_used],
+      )
+      memory_summary = memory.get_context_summary()
 
       intent_outcome = track_intent_vs_outcome(
           session_id=session_id,
@@ -420,6 +526,8 @@ async def chat_endpoint(request: ChatRequest):
           reasoning=reasoning_text,
           trace_id=trace_id_hex,
           latency_ms=round(duration_ms, 2),
+          tools_used=tools_used,
+          memory_context=memory_summary,
           intent_vs_outcome=intent_outcome,
       )
 
@@ -428,4 +536,4 @@ if __name__ == "__main__":
   import uvicorn
 
   port = int(os.environ.get("PORT", 8080))
-  uvicorn.run(app, host="0.0.0.0", port=port)
+  uvicorn.run("server:app", host="0.0.0.0", port=port, reload=False)

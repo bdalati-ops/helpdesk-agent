@@ -613,7 +613,7 @@
     if (indicator) indicator.remove();
   }
 
-  function appendAgentMessage(response, route, nodesVisited, reasoning, traceId, latencyMs, intentVsOutcome) {
+  function appendAgentMessage(response, route, nodesVisited, reasoning, traceId, latencyMs, intentVsOutcome, toolsUsed, memoryContext) {
     const msgDiv = document.createElement('div');
     msgDiv.className = 'message agent';
 
@@ -631,6 +631,20 @@
     }
     if (traceId) {
       telemetryBadgeHtml += `<span class="route-pill" style="background:#ede9fe;border:1px solid #ddd6fe;color:#6d28d9;" title="OpenTelemetry Trace ID: ${traceId}">🔍 Trace: ${traceId.slice(0, 8)}…</span>`;
+    }
+
+    // Tools badge
+    let toolsBadgeHtml = '';
+    if (toolsUsed && toolsUsed.length > 0) {
+      const toolNames = toolsUsed.map(t => t.name || 'tool').join(', ');
+      toolsBadgeHtml = `<span class="route-pill" style="background:#e0f2fe;border:1px solid #bae6fd;color:#0369a1;" title="Tools Executed: ${toolNames}">🔧 Tool: ${toolNames}</span>`;
+    }
+
+    // Memory Context badge
+    let memoryBadgeHtml = '';
+    if (memoryContext && (memoryContext.active_tracking_number || memoryContext.turn_count > 1)) {
+      const trackRef = memoryContext.active_tracking_number ? ` [${memoryContext.active_tracking_number}]` : '';
+      memoryBadgeHtml = `<span class="route-pill" style="background:#fef3c7;border:1px solid #fde68a;color:#92400e;" title="Session memory active across turns">🧠 Memory (Turn ${memoryContext.turn_count || 1})${trackRef}</span>`;
     }
 
     // Graph Execution Trace & Intent vs Outcome
@@ -651,11 +665,13 @@
 
       traceHtml = `
         <details class="trace-details">
-          <summary>⚡ Observability & Graph Trace (${nodesVisited.length} nodes)</summary>
+          <summary>⚡ Observability, Tools & Memory (${nodesVisited.length} nodes)</summary>
           <div class="trace-content">
             <strong>DAG Path:</strong> ${traceString}<br>
             ${reasoning ? `<strong>Classifier Reasoning:</strong> ${reasoning}<br>` : ''}
             ${traceId ? `<strong>OTel Trace ID:</strong> <code>${traceId}</code><br>` : ''}
+            ${toolsUsed && toolsUsed.length > 0 ? `<strong>Tools Invoked:</strong> <code>${JSON.stringify(toolsUsed.map(t => t.name))}</code><br>` : ''}
+            ${memoryContext ? `<strong>Active Entities:</strong> <code>${JSON.stringify(memoryContext.all_tracking_numbers || [])}</code><br>` : ''}
             ${intentHtml}
           </div>
         </details>
@@ -668,6 +684,8 @@
         <div class="message-bubble">${renderMarkdown(response)}</div>
         <div class="meta-box">
           ${routeBadgeHtml}
+          ${toolsBadgeHtml}
+          ${memoryBadgeHtml}
           ${telemetryBadgeHtml}
           ${traceHtml}
         </div>
@@ -709,7 +727,9 @@
         data.reasoning,
         data.trace_id,
         data.latency_ms,
-        data.intent_vs_outcome
+        data.intent_vs_outcome,
+        data.tools_used,
+        data.memory_context
       );
     } catch (e) {
       removeTypingIndicator();

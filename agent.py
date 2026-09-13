@@ -1,22 +1,21 @@
 """ADK 2.0 Customer Support Graph Workflow Agent for a Shipping Company.
 
-This workflow serves as a customer support representative for SwiftShip, a
-shipping and logistics provider. It classifies incoming user queries into
-shipping-related topics (rates, tracking, delivery, returns) versus unrelated
-topics. It routes shipping queries to a dedicated Shipping FAQ agent and
-unrelated queries to a node that politely declines to answer.
+Features:
+  - Tool & Interface Design: Callable domain tools for tracking, rate calculation, policies, and RMA generation.
+  - Context & Memory: Multi-turn session memory, entity extraction (SW-..., zips, weights), and context resolution.
+  - Orchestration & Logic: Intelligent intent classification, dynamic DAG routing, and graceful degradation.
 """
 
 import os
 import sys
 import time
-from typing import Literal
+from typing import Any, Dict, List, Literal, Optional
 from google.adk import Agent, Context, Event, Workflow
 from google.adk.apps import App
 from google.adk.workflow import START
 from pydantic import BaseModel, Field
 
-# Ensure observability can be imported
+# Ensure local modules can be imported
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 if current_dir not in sys.path:
@@ -26,15 +25,31 @@ if parent_dir not in sys.path:
 
 try:
   from customer_support_agent.observability import PIIRedactor, get_logger, get_tracer
+  from customer_support_agent.tools import (
+      track_package,
+      calculate_shipping_rate,
+      query_delivery_policies,
+      create_return_request,
+  )
+  from customer_support_agent.memory import MemoryStore, SessionMemory
 except ImportError:
   from observability import PIIRedactor, get_logger, get_tracer
+  from tools import (
+      track_package,
+      calculate_shipping_rate,
+      query_delivery_policies,
+      create_return_request,
+  )
+  from memory import MemoryStore, SessionMemory
 
 logger = get_logger("swiftship.agent.workflow")
 tracer = get_tracer("swiftship.agent.workflow")
 
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
 
 class QueryClassification(BaseModel):
-  """Structured classification result for customer queries."""
+  """Structured classification result for customer queries with intent and confidence scoring."""
 
   category: Literal["shipping", "unrelated"] = Field(
       description=(
@@ -43,6 +58,14 @@ class QueryClassification(BaseModel):
           " returns/exchanges; 'unrelated' for queries outside of shipping."
       )
   )
+  sub_intent: Optional[str] = Field(
+      default="general",
+      description="Specific sub-intent: tracking, rates, delivery_policy, returns, general_faq, or unrelated.",
+  )
+  confidence: float = Field(
+      default=1.0,
+      description="Confidence score for this classification between 0.0 and 1.0.",
+  )
   reasoning: str = Field(
       default="",
       description="Brief explanation justifying the chosen classification.",
@@ -50,57 +73,78 @@ class QueryClassification(BaseModel):
 
 
 def process_user_query(node_input: str) -> Event:
-  """Extracts the incoming user query, sanitizes PII for telemetry, and records it in session state."""
+  """
+  Ingests the incoming user query, enriches it with multi-turn session memory,
+  extracts logistics entities (tracking IDs, ZIP codes, weights), and sanitizes PII.
+  """
   with tracer.start_as_current_span("workflow.process_user_query") as span:
     redacted_query = PIIRedactor.redact(node_input)
     span.set_attribute("workflow.node", "process_user_query")
     span.set_attribute("customer.query_redacted", redacted_query)
 
+    # Resolve or create session memory context
+    session_id = os.getenv("CURRENT_SESSION_ID", "default_session")
+    memory = MemoryStore.get_or_create(session_id)
+    extracted_entities = memory.add_user_turn(node_input)
+    enriched_query = memory.enrich_query_with_context(node_input)
+    context_summary = memory.get_context_summary()
+
+    span.set_attribute("memory.turn_count", context_summary["turn_count"])
+    if context_summary.get("active_tracking_number"):
+      span.set_attribute("memory.active_tracking_id", context_summary["active_tracking_number"])
+
     logger.info(
-        "Processing user query in workflow node",
+        "Processing user query with multi-turn memory enrichment",
         extra={
             "event_type": "node_execution",
             "structured_context": {
                 "node": "process_user_query",
+                "session_id": session_id,
                 "query_length": len(node_input),
                 "query_redacted": redacted_query[:120],
+                "extracted_entities": extracted_entities,
+                "memory_turn_count": context_summary["turn_count"],
             },
         },
     )
 
     return Event(
-        output=node_input,
+        output=enriched_query,
         state={
-            "user_query": node_input,
+            "user_query": enriched_query,
+            "raw_user_query": node_input,
+            "session_id": session_id,
+            "entities": extracted_entities,
+            "context_summary": context_summary,
             "workflow_start_time": time.time(),
         },
     )
 
 
-DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-
 classifier_agent = Agent(
     name="query_classifier",
     model=DEFAULT_MODEL,
-    description="Classifies customer inquiries into 'shipping' or 'unrelated'.",
+    description="Classifies customer inquiries into 'shipping' or 'unrelated' with intent categorization.",
     instruction="""\
 You are an intent classification specialist for SwiftShip, a commercial shipping and logistics company.
 
 Analyze the incoming customer query:
 "{user_query}"
 
-Classify the query into exactly one of two categories:
+Classify the query into exactly one of two primary categories:
 1. "shipping": The query is related to shipping or logistics services, including:
    - Shipping rates, pricing quotes, weight/dimensional surcharges, and speed options.
    - Package tracking, tracking numbers, in-transit updates, delivery dates, and status checks.
    - Delivery issues, signature requirements, address changes, access point holds, or missed attempts.
    - Return policies, generating return labels, drop-off locations, return pickups, and exchange transit.
+   Set 'sub_intent' to one of: 'tracking', 'rates', 'delivery_policy', 'returns', or 'general_faq'.
 
 2. "unrelated": The query is completely unrelated to shipping or parcel delivery. Examples:
    - General knowledge, coding, weather, math problems, jokes, poems, or cooking recipes.
    - Non-shipping product questions, casual chit-chat, or unrelated technical support.
+   Set 'sub_intent' to 'unrelated'.
 
-Output your classification matching the required JSON schema with 'category' and 'reasoning'.
+Output your classification matching the required JSON schema with 'category', 'sub_intent', 'confidence', and 'reasoning'.
 """,
     output_schema=QueryClassification,
     output_key="classification",
@@ -110,28 +154,32 @@ Output your classification matching the required JSON schema with 'category' and
 def route_query(node_input: Any):
   """Evaluates the classification output and yields the appropriate graph route."""
   with tracer.start_as_current_span("workflow.route_query") as span:
-    # Determine category and reasoning safely
     if isinstance(node_input, QueryClassification):
       category = node_input.category
       reasoning = node_input.reasoning
+      sub_intent = node_input.sub_intent or "general"
     elif isinstance(node_input, dict):
       category = node_input.get("category", "shipping")
       reasoning = node_input.get("reasoning", "")
+      sub_intent = node_input.get("sub_intent", "general")
     else:
       category = getattr(node_input, "category", "shipping")
       reasoning = getattr(node_input, "reasoning", "")
+      sub_intent = getattr(node_input, "sub_intent", "general")
 
     span.set_attribute("workflow.node", "route_query")
     span.set_attribute("intent.category", category)
+    span.set_attribute("intent.sub_intent", sub_intent)
     span.set_attribute("intent.reasoning", PIIRedactor.redact(reasoning))
 
     logger.info(
-        f"Evaluating intent route: '{category}'",
+        f"Evaluating intent route: '{category}' (sub_intent: '{sub_intent}')",
         extra={
             "event_type": "routing_decision",
             "structured_context": {
                 "node": "route_query",
                 "category": category,
+                "sub_intent": sub_intent,
                 "reasoning": PIIRedactor.redact(reasoning),
             },
         },
@@ -144,46 +192,33 @@ shipping_faq_agent = Agent(
     name="shipping_faq_agent",
     model=DEFAULT_MODEL,
     description=(
-        "Customer support representative answering shipping FAQs on rates,"
-        " tracking, delivery, and returns."
+        "Customer support representative answering shipping inquiries and executing tools"
+        " for rates, tracking, delivery policies, and return label generation."
     ),
     instruction="""\
-You are a friendly, courteous, and knowledgeable customer support representative for SwiftShip, a premier shipping and logistics company.
+You are a friendly, knowledgeable, and empathetic customer support representative for SwiftShip, a premier shipping and logistics company.
 
-Customer Query:
+Customer Inquiry & Session Context:
 "{user_query}"
 
-Provide an accurate, clear, and empathetic answer based on SwiftShip services:
+You have access to official SwiftShip tools to retrieve live data and assist customers:
+1. `track_package(tracking_number)`: Call to look up real-time delivery status, location, history, and delivery ETA for any tracking number (e.g. SW-123456789).
+2. `calculate_shipping_rate(origin_zip, destination_zip, weight_lbs, service_tier)`: Call to calculate exact rates and transit times for Ground, Express, or Overnight.
+3. `query_delivery_policies(topic)`: Call to look up official rules regarding signatures, Access Point holds, weekend deliveries, or oversized cargo.
+4. `create_return_request(tracking_number, order_id, reason)`: Call to generate a Return Merchandise Authorization (RMA) and prepaid shipping label / QR code.
 
-1. Shipping Rates & Service Tiers:
-   - Standard Ground: 3 to 5 business days, starting at $5.99.
-   - Priority Express: 2 business days, starting at $12.99.
-   - Overnight Express: Next business day guaranteed by 10:30 AM, starting at $24.99.
-   - International Shipping: 5 to 10 business days depending on customs and destination country.
-   - Rates depend on package weight, package dimensions, origin, and destination zip codes.
-
-2. Package Tracking & Status:
-   - Tracking numbers are typically 10 to 12 alphanumeric characters (e.g., SW-123456789).
-   - Common statuses: "Order Manifest Received", "In Transit", "Out for Delivery", "Delivered", and "Delivery Exception".
-   - Customers can view real-time status and enable SMS/email alerts on the SwiftShip tracking portal.
-
-3. Delivery Policies:
-   - Delivery operates Monday through Saturday between 8:00 AM and 8:00 PM local time.
-   - Direct signature is required for packages valued over $500 or containing restricted goods.
-   - If a customer is away, packages can be safely held at any local SwiftShip Access Point for up to 7 calendar days.
-   - Address adjustments can be made before the package arrives at the local delivery hub.
-
-4. Returns & Exchanges:
-   - Return shipping labels can be generated via the online portal or printed at drop-off kiosks using a mobile QR code.
-   - Drop-offs are accepted at all SwiftShip branches, partner lockers, and authorized retail drop boxes.
-   - Scheduled courier pickup is available for return shipments.
-   - Return transit typically takes 3 to 5 business days before merchant inspection and refund authorization.
-
-Tone & Guidelines:
-- Maintain a warm, helpful, and professional customer service tone.
-- Use clear bullet points or short paragraphs for readability.
-- If the customer does not provide specific details (like a tracking number, package weight, or postal codes), provide general guidance and politely invite them to provide the missing details so you can assist further.
+Multi-Turn Context & Memory Guidelines:
+- Pay close attention to conversational context. If the customer previously mentioned a tracking number or asks "where is it?" / "when will it arrive?", resolve the active tracking number from the session context and call `track_package` without asking the customer to re-enter it.
+- If the customer provided postal codes or weights earlier in the conversation, use them when calculating rates.
+- If a tool returns data, explain the results clearly in a warm, professional customer service tone using bullet points.
+- If details are missing to execute a tool (e.g., neither query nor memory contains a tracking number), provide helpful general information and politely invite the customer to supply the details.
 """,
+    tools=[
+        track_package,
+        calculate_shipping_rate,
+        query_delivery_policies,
+        create_return_request,
+    ],
 )
 
 
@@ -221,9 +256,7 @@ def decline_unrelated_query():
 root_agent = Workflow(
     name="customer_support_workflow",
     description=(
-        "Customer support workflow that classifies user inquiries and routes"
-        " shipping queries to a Shipping FAQ agent or politely declines"
-        " unrelated queries."
+        "Customer support workflow with multi-turn memory, intent classification, and tool-augmented routing."
     ),
     edges=[
         ("START", process_user_query, classifier_agent, route_query),

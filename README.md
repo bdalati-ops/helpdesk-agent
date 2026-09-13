@@ -17,18 +17,48 @@ Deployment files are omitted as requested.
 
 ---
 
-## Workflow Topology
+## Workflow Topology & Architectural Highlights
 
 ```mermaid
 flowchart TD
-    START([START]) --> ProcessInput["process_user_query\n(Record query in session state)"]
-    ProcessInput --> Classifier["query_classifier (Agent)\n(output_schema: QueryClassification)"]
+    START([START]) --> ProcessInput["process_user_query\n• Multi-Turn Memory Resolution\n• Entity Extraction (SW-..., zips, weights)\n• PII Sanitization & Telemetry"]
+    ProcessInput --> Classifier["query_classifier (Agent)\n• Intent & Sub-Intent Categorization\n• Confidence Scoring & Reasoning"]
     Classifier --> Router{"route_query\n(Conditional Branch)"}
-    Router -->|route: shipping| ShippingFAQ["shipping_faq_agent (Agent)\n(Answers Rates, Tracking, Delivery, Returns)"]
+    Router -->|route: shipping| ShippingFAQ["shipping_faq_agent (Agent)\n• Equipped with 4 Callable Domain Tools\n• Multi-Turn Context-Aware Synthesis"]
     Router -->|route: unrelated| DeclineNode["decline_unrelated_query (Node)\n(Politely declines to answer)"]
+    ShippingFAQ -.-> Tools["Domain Tools (tools.py)\n• track_package\n• calculate_shipping_rate\n• query_delivery_policies\n• create_return_request"]
+    Tools -.-> ShippingFAQ
     ShippingFAQ --> END([END])
     DeclineNode --> END([END])
 ```
+
+---
+
+## Key Capabilities
+
+### 1. Tool & Interface Design
+- **Callable Domain Tools** ([`tools.py`](tools.py)):
+  - `track_package(tracking_number)`: Queries parcel status, origin, destination, ETA, and event timelines.
+  - `calculate_shipping_rate(origin_zip, destination_zip, weight_lbs, service_tier)`: Instant dimensional rate calculation for Ground, Express, and Overnight tiers.
+  - `query_delivery_policies(topic)`: Official policies on access point holds (7 days), signature requirements ($500+), and weekend deliveries.
+  - `create_return_request(tracking_number, order_id, reason)`: Generates authorized RMA numbers, printable PDF label URLs, and mobile QR codes.
+- **REST Interface Design** ([`server.py`](server.py)):
+  - `POST /api/chat`: Typed chat turns returning tools used, memory context, trace IDs, and intent alignment.
+  - `GET /api/tools`: Introspectable tool catalog with parameter schemas.
+  - `GET /api/session/{id}` & `DELETE /api/session/{id}`: Session inspection and memory management.
+  - `POST /api/feedback`: User satisfaction telemetry collection.
+
+### 2. Context & Memory
+- **Multi-Turn Entity Extraction** ([`memory.py`](memory.py)):
+  - Continuously tracks package tracking IDs (`SW-...`), 5-digit postal codes, parcel weights, and order IDs across conversational turns.
+  - Resolves implicit pronoun references (`"when will it arrive?"` automatically refers to previously mentioned tracking numbers).
+  - Enriches the incoming prompt with active session memory so the agent maintains state across turns.
+
+### 3. Orchestration & Logic
+- **Granular Intent Classification**: Classifies queries into `shipping` (with sub-intents: `tracking`, `rates`, `delivery_policy`, `returns`, `general_faq`) vs. `unrelated`.
+- **Fault-Tolerant Resilience Engine** ([`resilience.py`](resilience.py)):
+  - Handles `503 UNAVAILABLE`, quota limits, and temporary model spikes with exponential backoff and jitter.
+  - Automatic graceful degradation executes domain tools directly during model outages to ensure continuous service with zero HTTP 500/503 errors.
 
 ---
 
@@ -36,12 +66,12 @@ flowchart TD
 
 | Component | Type | Responsibility |
 |---|---|---|
-| `process_user_query` | Function Node | Takes user message from `START`, outputs the query text, and populates `ctx.state['user_query']` for downstream template resolution. |
-| `query_classifier` | `LlmAgent` | Evaluates the query using `gemini-2.5-flash` with a strict structured `output_schema` (`QueryClassification`) returning `"shipping"` or `"unrelated"`. |
-| `route_query` | Function Node | Inspects the classification result and yields an `Event(route=...)` directing graph execution. |
-| `shipping_faq_agent` | `LlmAgent` | Domain specialist handling shipping rates (ground, priority, overnight, international), tracking milestones, delivery windows/signatures, and return logistics. |
-| `decline_unrelated_query` | Function Node | Yields customer-facing polite decline `Event(message=..., output=...)` to handle off-topic requests. |
-| `root_agent` | `Workflow` | Top-level graph combining sequential transitions and conditional branching. |
+| `process_user_query` | Function Node | Ingests query, extracts entities into `SessionMemory`, enriches prompt with cross-turn context, and sanitizes PII. |
+| `query_classifier` | `LlmAgent` | Classifies intent into categories and sub-intents with confidence scoring. |
+| `route_query` | Function Node | Evaluates classification output and directs workflow traversal. |
+| `shipping_faq_agent` | `LlmAgent` + Tools | Tool-augmented agent executing tracking, rate calculations, policies, and RMA generation. |
+| `decline_unrelated_query` | Function Node | Deterministic polite decline node handling non-shipping queries. |
+| `root_agent` | `Workflow` | Top-level graph managing state transitions, memory propagation, and routing. |
 
 ---
 
