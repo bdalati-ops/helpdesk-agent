@@ -1,0 +1,157 @@
+name: SwiftShip CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  # ============================================================================
+  # 1. Lint, Security & Secret Scanning
+  # ============================================================================
+  security-and-lint:
+    name: Lint & Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Linting & Security Tools
+        run: |
+          pip install flake8 bandit
+
+      - name: Run Syntax & Lint Checks
+        run: |
+          # Stop the build if there are Python syntax errors or undefined names
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          # Warning checks with relaxed line lengths for long prompts/templates
+          flake8 . --count --exit-zero --max-complexity=15 --max-line-length=120 --statistics
+
+      - name: Secret Scanning
+        run: |
+          echo "Scanning for accidental secrets or tokens in repository..."
+          # Check for high-entropy tokens or exposed keys
+          if grep -rEI "(ghp_[a-zA-Z0-9]{36}|AIza[0-9A-Za-z-_]{35}|ya29\.[0-9A-Za-z-_]+)" --exclude-dir={.git,.venv,eval} --exclude="observability.py" .; then
+            echo "❌ Potential exposed secrets found in repository!"
+            exit 1
+          fi
+          echo "✓ Zero credentials found in code."
+
+  # ============================================================================
+  # 2. Unit Tests & Automated Golden Dataset Evaluation Gate
+  # ============================================================================
+  eval-and-tests:
+    name: Golden Dataset Evaluation & Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest fastapi uvicorn python-dotenv
+
+      - name: Run Unit Test Suite
+        run: |
+          pytest tests/test_workflow.py tests/test_observability.py tests/test_secrets_manager.py -v
+
+      - name: Run Automated Evaluation against Golden Dataset
+        run: |
+          python eval/evaluate.py --min-accuracy 0.90 --output eval/eval_report.json
+
+      - name: Upload Evaluation Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: golden-evaluation-report
+          path: eval/eval_report.json
+
+  # ============================================================================
+  # 3. Terraform IaC Validation
+  # ============================================================================
+  terraform-validate:
+    name: Terraform Format & Validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      - name: Terraform Format Check
+        run: terraform -chdir=terraform fmt -check
+
+      - name: Terraform Init
+        run: terraform -chdir=terraform init -backend=false
+
+      - name: Terraform Validate
+        run: terraform -chdir=terraform validate
+
+  # ============================================================================
+  # 4. Container Build & Packaging Verification
+  # ============================================================================
+  container-build:
+    name: Docker Build Verification
+    runs-on: ubuntu-latest
+    needs: [security-and-lint, eval-and-tests, terraform-validate]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Container Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: customer-support-agent:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ============================================================================
+  # 5. Continuous Deployment to Cloud Run (Runs on main branch with GCP secrets)
+  # ============================================================================
+  deploy:
+    name: Deploy to Google Cloud Run
+    runs-on: ubuntu-latest
+    needs: [container-build]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && vars.GCP_PROJECT_ID != ''
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy to Cloud Run via Secret Manager
+        run: |
+          ./deploy.sh "${{ vars.GCP_PROJECT_ID }}" "${{ vars.GCP_REGION || 'us-central1' }}" "customer-support-agent"

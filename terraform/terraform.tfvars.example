@@ -1,0 +1,10 @@
+# Example Terraform variables configuration
+project_id               = "YOUR_GCP_PROJECT_ID"
+region                   = "us-central1"
+service_name             = "customer-support-agent"
+gemini_api_key_secret_id = "gemini-api-key"
+min_instances            = 0
+max_instances            = 5
+cpu_limit                = "1"
+memory_limit             = "1Gi"
+allow_unauthenticated    = true

@@ -49,6 +49,13 @@ except ImportError:
 tracer = setup_observability(service_name="swiftship-customer-support")
 logger = get_logger("swiftship.server")
 
+# Secure Secret Management (GCP Secret Manager with env fallback)
+try:
+  from customer_support_agent.secrets_manager import initialize_app_secrets
+except ImportError:
+  from secrets_manager import initialize_app_secrets
+initialize_app_secrets()
+
 from customer_support_agent.agent import root_agent
 
 app = FastAPI(

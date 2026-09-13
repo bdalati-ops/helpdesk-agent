@@ -1,0 +1,71 @@
+steps:
+  # 1. Run Automated Evaluation Suite against Golden Dataset
+  - name: 'python:3.11-slim'
+    id: 'run-eval-suite'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        pip install -r requirements.txt pytest
+        python eval/evaluate.py --min-accuracy 0.90 --output eval/eval_report.json
+
+  # 2. Build Container Image
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-image'
+    args:
+      - 'build'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/customer-support-repo/agent:${SHORT_SHA}'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/customer-support-repo/agent:latest'
+      - '.'
+
+  # 3. Push Container Image to Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-image'
+    args:
+      - 'push'
+      - '--all-tags'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/customer-support-repo/agent'
+
+  # 4. Deploy to Cloud Run with Secret Manager Mount
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'deploy-cloud-run'
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - '${_SERVICE_NAME}'
+      - '--image'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/customer-support-repo/agent:${SHORT_SHA}'
+      - '--region'
+      - '${_REGION}'
+      - '--project'
+      - '${PROJECT_ID}'
+      - '--port'
+      - '8080'
+      - '--allow-unauthenticated'
+      - '--set-env-vars'
+      - 'GOOGLE_GENAI_USE_ENTERPRISE=FALSE,GEMINI_API_KEY_SECRET_ID=${_SECRET_NAME}'
+      - '--set-secrets'
+      - 'GOOGLE_API_KEY=${_SECRET_NAME}:latest,GEMINI_API_KEY=${_SECRET_NAME}:latest'
+      - '--min-instances'
+      - '0'
+      - '--max-instances'
+      - '5'
+      - '--memory'
+      - '1Gi'
+      - '--cpu'
+      - '1'
+
+substitutions:
+  _REGION: 'us-central1'
+  _SERVICE_NAME: 'customer-support-agent'
+  _SECRET_NAME: 'gemini-api-key'
+
+images:
+  - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/customer-support-repo/agent:${SHORT_SHA}'
+  - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/customer-support-repo/agent:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY

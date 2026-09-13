@@ -215,10 +215,67 @@ if __name__ == "__main__":
 
 ---
 
-## Running Tests
+## Running Tests & Evaluation Suite
 
-Execute the automated test suite with pytest:
-
+### Unit & Observability Tests
 ```bash
-pytest
+pytest tests/test_workflow.py tests/test_observability.py tests/test_secrets_manager.py -v
 ```
+
+### Automated Evaluation against Golden Dataset
+Evaluate the agent against the curated 25-case golden benchmark dataset with automated quality gates:
+```bash
+python eval/evaluate.py --min-accuracy 0.90 --output eval/eval_report.json
+```
+Metrics computed include:
+- Intent classification accuracy & F1 score
+- DAG routing alignment rate
+- Latency benchmarks (P50, P95, mean)
+- Detailed per-sample routing breakdown
+
+---
+
+## Secret Management (Google Cloud Secret Manager)
+
+To eliminate plain-text `.env` files in production, secrets are dynamically loaded from Google Cloud Secret Manager via `secrets_manager.py`:
+- **Secret ID**: `gemini-api-key` (configurable via `GEMINI_API_KEY_SECRET_ID`)
+- **Mounting**: Automatically mounted into Cloud Run containers via Secret Manager environment variable references (`value_source.secret_key_ref`).
+- **Local Development**: Automatically falls back to environment variables or `.env` when executing locally.
+- **Redaction**: All secrets (`AIza...`, `ghp_...`, `ya29...`) are automatically redacted from logs and traces by `PIIRedactor`.
+
+---
+
+## Infrastructure as Code (Terraform)
+
+Production infrastructure is fully codified under the `terraform/` directory:
+- **Cloud Run v2 Service**: Auto-scaling (0-5 instances), CPU/memory limits, probes, and Secret Manager bindings.
+- **Artifact Registry**: Docker repository for versioned container images.
+- **Secret Manager**: Dedicated encrypted secret resource with least-privilege IAM bindings.
+- **Service Account**: Minimal IAM roles (`secretmanager.secretAccessor`, `logging.logWriter`, `cloudtrace.agent`).
+
+### Deploying with Terraform
+```bash
+cd terraform
+cp terraform.tfvars.example terraform.tfvars
+# Update terraform.tfvars with your GCP project ID
+terraform init
+terraform plan
+terraform apply
+```
+
+---
+
+## CI/CD Automation
+
+Continuous Integration and Continuous Deployment are provided via two complementary pipelines:
+
+1. **GitHub Actions (`.github/workflows/ci-cd.yml`)**:
+   - **Security & Secret Scanning**: Automated audit for leaked tokens and syntax issues.
+   - **Evaluation Quality Gate**: Runs unit tests and golden dataset evaluation, blocking PRs if accuracy drops below 90%.
+   - **Terraform Validation**: Verifies IaC formatting and configuration.
+   - **Container Build**: Automated Docker build and caching.
+   - **Continuous Deployment**: Deploys approved commits on `main` directly to Cloud Run using Workload Identity Federation.
+
+2. **Google Cloud Build (`cloudbuild.yaml`)**:
+   - Native GCP build pipeline running golden evaluation tests, building and pushing images to Artifact Registry, and deploying to Cloud Run with Secret Manager mounting.
+
