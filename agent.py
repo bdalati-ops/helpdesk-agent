@@ -77,9 +77,11 @@ def process_user_query(node_input: str) -> Event:
     )
 
 
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
 classifier_agent = Agent(
     name="query_classifier",
-    model="gemini-3.6-flash",
+    model=DEFAULT_MODEL,
     description="Classifies customer inquiries into 'shipping' or 'unrelated'.",
     instruction="""\
 You are an intent classification specialist for SwiftShip, a commercial shipping and logistics company.
@@ -105,31 +107,42 @@ Output your classification matching the required JSON schema with 'category' and
 )
 
 
-def route_query(node_input: QueryClassification):
+def route_query(node_input: Any):
   """Evaluates the classification output and yields the appropriate graph route."""
   with tracer.start_as_current_span("workflow.route_query") as span:
+    # Determine category and reasoning safely
+    if isinstance(node_input, QueryClassification):
+      category = node_input.category
+      reasoning = node_input.reasoning
+    elif isinstance(node_input, dict):
+      category = node_input.get("category", "shipping")
+      reasoning = node_input.get("reasoning", "")
+    else:
+      category = getattr(node_input, "category", "shipping")
+      reasoning = getattr(node_input, "reasoning", "")
+
     span.set_attribute("workflow.node", "route_query")
-    span.set_attribute("intent.category", node_input.category)
-    span.set_attribute("intent.reasoning", PIIRedactor.redact(node_input.reasoning))
+    span.set_attribute("intent.category", category)
+    span.set_attribute("intent.reasoning", PIIRedactor.redact(reasoning))
 
     logger.info(
-        f"Evaluating intent route: '{node_input.category}'",
+        f"Evaluating intent route: '{category}'",
         extra={
             "event_type": "routing_decision",
             "structured_context": {
                 "node": "route_query",
-                "category": node_input.category,
-                "reasoning": PIIRedactor.redact(node_input.reasoning),
+                "category": category,
+                "reasoning": PIIRedactor.redact(reasoning),
             },
         },
     )
 
-    yield Event(route=node_input.category)
+    yield Event(route=category)
 
 
 shipping_faq_agent = Agent(
     name="shipping_faq_agent",
-    model="gemini-3.6-flash",
+    model=DEFAULT_MODEL,
     description=(
         "Customer support representative answering shipping FAQs on rates,"
         " tracking, delivery, and returns."

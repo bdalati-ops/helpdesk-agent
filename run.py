@@ -35,6 +35,21 @@ except ImportError:
   from secrets_manager import initialize_app_secrets
 initialize_app_secrets()
 
+try:
+  from customer_support_agent.resilience import (
+      classify_query_heuristically,
+      generate_fallback_shipping_response,
+      generate_fallback_decline_response,
+      is_retryable_error,
+  )
+except ImportError:
+  from resilience import (
+      classify_query_heuristically,
+      generate_fallback_shipping_response,
+      generate_fallback_decline_response,
+      is_retryable_error,
+  )
+
 from customer_support_agent.agent import root_agent
 
 
@@ -70,32 +85,68 @@ async def run_query(runner: InMemoryRunner, session_id: str, query: str):
     route_taken = None
     reasoning_text = None
 
-    async for event in runner.run_async(
-        user_id="user_1",
-        session_id=session_id,
-        new_message=message,
-    ):
-      if event.node_info and event.node_info.path:
-        node_name = event.node_info.path.split("/")[-1].split("@")[0]
-        if node_name not in nodes_visited:
-          nodes_visited.append(node_name)
+    try:
+      max_attempts = 3
+      last_err = None
+      for attempt in range(1, max_attempts + 1):
+        try:
+          agent_response_parts.clear()
+          nodes_visited.clear()
+          route_taken = None
+          reasoning_text = None
 
-      if hasattr(event, "actions") and event.actions and event.actions.route:
-        route_taken = event.actions.route
+          async for event in runner.run_async(
+              user_id="user_1",
+              session_id=session_id,
+              new_message=message,
+          ):
+            if event.node_info and event.node_info.path:
+              node_name = event.node_info.path.split("/")[-1].split("@")[0]
+              if node_name not in nodes_visited:
+                nodes_visited.append(node_name)
 
-      if event.content and event.content.parts:
-        for part in event.content.parts:
-          if part.text:
-            if '"category":' in part.text and '"reasoning":' in part.text:
-              try:
-                import json
-                parsed = json.loads(part.text)
-                route_taken = parsed.get("category", route_taken)
-                reasoning_text = parsed.get("reasoning")
-              except Exception:
-                pass
-            else:
-              agent_response_parts.append(part.text)
+            if hasattr(event, "actions") and event.actions and event.actions.route:
+              route_taken = event.actions.route
+
+            if event.content and event.content.parts:
+              for part in event.content.parts:
+                if part.text:
+                  if '"category":' in part.text and '"reasoning":' in part.text:
+                    try:
+                      import json
+                      parsed = json.loads(part.text)
+                      route_taken = parsed.get("category", route_taken)
+                      reasoning_text = parsed.get("reasoning")
+                    except Exception:
+                      pass
+                  else:
+                    agent_response_parts.append(part.text)
+
+          last_err = None
+          break
+        except Exception as run_err:
+          last_err = run_err
+          if is_retryable_error(run_err) and attempt < max_attempts:
+            backoff = 0.5 * (2 ** (attempt - 1))
+            logger.warning(f"Transient model error in CLI turn: {run_err}. Retrying in {backoff:.2f}s...")
+            await asyncio.sleep(backoff)
+          else:
+            raise run_err
+
+      if last_err:
+        raise last_err
+
+    except Exception as e:
+      logger.warning(f"CLI turn encountered model outage ({e}). Engaging graceful fallback.")
+      fallback = classify_query_heuristically(query)
+      route_taken = fallback["category"]
+      reasoning_text = fallback["reasoning"]
+      if route_taken == "shipping":
+        nodes_visited = ["process_user_query", "query_classifier", "route_query", "shipping_faq_agent"]
+        agent_response_parts = [generate_fallback_shipping_response(query)]
+      else:
+        nodes_visited = ["process_user_query", "query_classifier", "route_query", "decline_unrelated_query"]
+        agent_response_parts = [generate_fallback_decline_response()]
 
     duration_ms = (time.perf_counter() - start_time) * 1000
     target_node = (

@@ -58,6 +58,22 @@ initialize_app_secrets()
 
 from customer_support_agent.agent import root_agent
 
+# Resilience & Fault Tolerance (503 UNAVAILABLE & demand spike handling)
+try:
+  from customer_support_agent.resilience import (
+      classify_query_heuristically,
+      generate_fallback_shipping_response,
+      generate_fallback_decline_response,
+      is_retryable_error,
+  )
+except ImportError:
+  from resilience import (
+      classify_query_heuristically,
+      generate_fallback_shipping_response,
+      generate_fallback_decline_response,
+      is_retryable_error,
+  )
+
 app = FastAPI(
     title="SwiftShip Customer Support Agent",
     description="ADK 2.0 Graph Workflow Agent for Shipping Customer Support with Observability & Tracing",
@@ -237,35 +253,64 @@ async def chat_endpoint(request: ChatRequest):
 
     try:
       with tracer.start_as_current_span("workflow.runner_execution") as wf_span:
-        async for event in runner.run_async(
-            user_id="web_user",
-            session_id=session_id,
-            new_message=message_content,
-        ):
-          # Track graph execution nodes
-          if event.node_info and event.node_info.path:
-            node_name = event.node_info.path.split("/")[-1].split("@")[0]
-            if node_name not in nodes_visited:
-              nodes_visited.append(node_name)
+        max_attempts = 3
+        last_err = None
+        for attempt in range(1, max_attempts + 1):
+          try:
+            nodes_visited.clear()
+            response_texts.clear()
+            route_taken = None
+            reasoning_text = None
 
-          # Track route if emitted
-          if hasattr(event, "actions") and event.actions and event.actions.route:
-            route_taken = event.actions.route
+            async for event in runner.run_async(
+                user_id="web_user",
+                session_id=session_id,
+                new_message=message_content,
+            ):
+              # Track graph execution nodes
+              if event.node_info and event.node_info.path:
+                node_name = event.node_info.path.split("/")[-1].split("@")[0]
+                if node_name not in nodes_visited:
+                  nodes_visited.append(node_name)
 
-          # Collect agent messages
-          if event.content and event.content.parts:
-            for part in event.content.parts:
-              if part.text:
-                # Check if this part contains classifier JSON metadata
-                if '"category":' in part.text and '"reasoning":' in part.text:
-                  try:
-                    parsed = json.loads(part.text)
-                    route_taken = parsed.get("category", route_taken)
-                    reasoning_text = parsed.get("reasoning")
-                  except Exception:
-                    pass
-                else:
-                  response_texts.append(part.text)
+              # Track route if emitted
+              if hasattr(event, "actions") and event.actions and event.actions.route:
+                route_taken = event.actions.route
+
+              # Collect agent messages
+              if event.content and event.content.parts:
+                for part in event.content.parts:
+                  if part.text:
+                    # Check if this part contains classifier JSON metadata
+                    if '"category":' in part.text and '"reasoning":' in part.text:
+                      try:
+                        parsed = json.loads(part.text)
+                        route_taken = parsed.get("category", route_taken)
+                        reasoning_text = parsed.get("reasoning")
+                      except Exception:
+                        pass
+                    else:
+                      response_texts.append(part.text)
+
+            last_err = None
+            break
+          except Exception as run_err:
+            last_err = run_err
+            if is_retryable_error(run_err) and attempt < max_attempts:
+              backoff = 0.5 * (2 ** (attempt - 1))
+              logger.warning(
+                  f"Transient model error (attempt {attempt}/{max_attempts}): {run_err}. Retrying in {backoff:.2f}s...",
+                  extra={
+                      "event_type": "runner_retry",
+                      "structured_context": {"attempt": attempt, "backoff": backoff, "error": str(run_err)},
+                  },
+              )
+              await asyncio.sleep(backoff)
+            else:
+              raise run_err
+
+        if last_err:
+          raise last_err
 
         wf_span.set_attribute("workflow.nodes_visited", ",".join(nodes_visited))
 
@@ -325,32 +370,57 @@ async def chat_endpoint(request: ChatRequest):
 
     except Exception as e:
       duration_ms = (time.perf_counter() - turn_start) * 1000
-      track_intent_vs_outcome(
-          session_id=session_id,
-          user_id="web_user",
-          customer_query=user_text,
-          intent_category="unknown",
-          intent_reasoning="Workflow error",
-          target_node="error",
-          outcome_action="failed",
-          nodes_visited=nodes_visited,
-          latency_ms=duration_ms,
-          error=str(e),
-      )
-      logger.error(
-          f"Workflow execution failed for session {session_id}: {e}",
-          exc_info=True,
+      logger.warning(
+          f"Workflow execution encountered model outage/transient error ({e}). Engaging graceful degradation.",
           extra={
-              "event_type": "chat_error",
+              "event_type": "workflow_graceful_fallback",
               "structured_context": {
                   "session_id": session_id,
                   "duration_ms": round(duration_ms, 2),
                   "error": str(e),
+                  "is_retryable": is_retryable_error(e),
               },
           },
       )
-      raise HTTPException(
-          status_code=500, detail=f"Workflow execution error: {str(e)}"
+
+      # Intelligent heuristic fallback response
+      fallback_intent = classify_query_heuristically(user_text)
+      route_taken = fallback_intent["category"]
+      reasoning_text = fallback_intent["reasoning"]
+
+      if route_taken == "shipping":
+        target_node = "shipping_faq_agent"
+        outcome_action = "answered_faq_fallback"
+        final_response = generate_fallback_shipping_response(user_text)
+        nodes_visited = ["process_user_query", "query_classifier", "route_query", "shipping_faq_agent"]
+      else:
+        target_node = "decline_unrelated_query"
+        outcome_action = "declined_unrelated_fallback"
+        final_response = generate_fallback_decline_response()
+        nodes_visited = ["process_user_query", "query_classifier", "route_query", "decline_unrelated_query"]
+
+      intent_outcome = track_intent_vs_outcome(
+          session_id=session_id,
+          user_id="web_user",
+          customer_query=user_text,
+          intent_category=route_taken,
+          intent_reasoning=reasoning_text,
+          target_node=target_node,
+          outcome_action=outcome_action,
+          nodes_visited=nodes_visited,
+          latency_ms=duration_ms,
+          response_summary=final_response[:200],
+      )
+
+      return ChatResponse(
+          response=final_response,
+          session_id=session_id,
+          nodes_visited=nodes_visited,
+          route=route_taken,
+          reasoning=reasoning_text,
+          trace_id=trace_id_hex,
+          latency_ms=round(duration_ms, 2),
+          intent_vs_outcome=intent_outcome,
       )
 
 
